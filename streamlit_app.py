@@ -1,9 +1,14 @@
 # streamlit_app.py
 # Fixed-Term Hours Planner (Working Document) — Streamlit
-# Implements your latest spec:
+# Improvements added:
+# - "Apply changes" button for planning tables (prevents uncommitted edits / non-updating)
+# - hide_index=True for tables (removes left index column)
+# - default leaver WTE to 1.0 when blank (reduces accidental 0.0)
+#
+# Core spec:
 # - Spreadsheet-style (no certainty mode; no status column on leavers)
 # - Part-time allocation lines include Increased Enrolment Allocation
-# - Leavers list (explicit rows) with Role dropdown (Teacher/Principal/Deputy Principal), no pre-population
+# - Leavers list with Role dropdown (Teacher/Principal/Deputy Principal), no pre-population
 # - Temporary absences split:
 #     (A) Job-sharers list: one row per job-sharing teacher; WTE = count/2
 #     (B) Career break / Secondment list: input current hours/week; app converts to WTE (hours/HoursPerPost)
@@ -15,11 +20,7 @@
 #     * Permanent vacancy capacity (if Perm Allocation > projected_perm_base)
 #     * CIDs assumed (non-declined) as reserved WTE
 # - Save/Load JSON
-# - Fixes common Streamlit data_editor schema errors by enforcing columns before editing
-#
-# Notes on "numbers not sticking":
-# Streamlit data grids commit edits when you press Enter or click away from the cell.
-# This code avoids re-creating dataframes unnecessarily, which reduces flicker.
+# - Schema-safe data_editor tables (prevents column mismatch errors)
 
 import json
 import streamlit as st
@@ -63,7 +64,7 @@ def ensure_columns(df: pd.DataFrame | None, cols: list[str]) -> pd.DataFrame:
         df = pd.DataFrame()
     for c in cols:
         if c not in df.columns:
-            df[c] = ""  # default; numeric coercion happens later where needed
+            df[c] = ""
     return df[cols].copy()
 
 
@@ -183,7 +184,10 @@ def init_state():
 
     if "part_time_df" not in st.session_state:
         st.session_state.part_time_df = pd.DataFrame(
-            {"Part-time allocation line": DEFAULT_PART_TIME_LINES, "WTE (Part-time)": [0.0] * len(DEFAULT_PART_TIME_LINES)}
+            {
+                "Part-time allocation line": DEFAULT_PART_TIME_LINES,
+                "WTE (Part-time)": [0.0] * len(DEFAULT_PART_TIME_LINES),
+            }
         )
 
     if "leavers_df" not in st.session_state:
@@ -212,12 +216,12 @@ st.set_page_config(page_title="Fixed-Term Hours Planner", layout="wide")
 init_state()
 
 st.title("Fixed-Term Hours Planner (Working Document)")
-st.caption("Spreadsheet-style: edit any figures whenever they change; everything updates.")
+st.caption("Spreadsheet-style: edit figures whenever they change; click Apply for the planning tables.")
 
-# Quick recovery button after major changes / loaded state conflicts
 with st.sidebar:
     st.header("Settings")
     st.number_input("Hours per post", key="hours_per_post", min_value=1.0, max_value=30.0, step=0.5)
+
     if st.button("Reset app state (if something looks wrong)"):
         st.session_state.clear()
         st.rerun()
@@ -233,7 +237,7 @@ with st.sidebar:
     upl = st.file_uploader("Load working document", type=["json"])
     if upl is not None:
         import_state(upl.read().decode("utf-8"))
-        st.success("Loaded working document. If anything looks odd, use 'Reset app state' once.")
+        st.success("Loaded working document. If anything looks odd, press Reset once.")
 
 hours_per_post = float(st.session_state.hours_per_post)
 
@@ -248,13 +252,14 @@ with left:
     st.number_input("Total Permanent Teachers (incl. CIDs) (WTE) — Page 2", key="perm_teachers_wte", step=0.01)
 
     st.markdown("**Part-time allocation lines (WTE) — Page 1 part-time column**")
-    # Schema-safe
     PT_COLS = ["Part-time allocation line", "WTE (Part-time)"]
     st.session_state.part_time_df = ensure_columns(st.session_state.part_time_df, PT_COLS)
+
     pt_df = st.data_editor(
         st.session_state.part_time_df,
         num_rows="dynamic",
         use_container_width=True,
+        hide_index=True,
         column_config={
             "Part-time allocation line": st.column_config.TextColumn(required=True),
             "WTE (Part-time)": st.column_config.NumberColumn(min_value=0.0, step=0.01),
@@ -263,7 +268,6 @@ with left:
     )
     st.session_state.part_time_df = pt_df
 
-    # Compute totals from a cleaned view (do not overwrite user df)
     pt_work = pt_df.copy()
     pt_work["Part-time allocation line"] = pt_work["Part-time allocation line"].fillna("").astype(str).str.strip()
     pt_work = pt_work[pt_work["Part-time allocation line"] != ""].copy()
@@ -274,85 +278,101 @@ with left:
     st.info(f"**Total Part-time Allocation:** {total_part_time_wte:.2f} WTE  \n**= {total_part_time_hours:.2f} hours/week**")
 
 with right:
-    st.subheader("2) Planning inputs (edit whenever things change)")
+    st.subheader("2) Planning inputs")
     st.number_input("Deployment inward (WTE) (optional)", key="deployment_inward_wte", step=0.01)
 
     st.markdown("---")
-    st.subheader("3) Leavers list (Retirements / Resignations)")
-    st.write("List leavers explicitly (including Principal/DP) so it’s always clear who is counted.")
+    st.write("Edit the tables below, then click **Apply changes** (this prevents lost edits).")
 
-    LEAVERS_COLS = ["Name/Label (optional)", "Role", "Leaving type", "WTE"]
-    st.session_state.leavers_df = ensure_columns(st.session_state.leavers_df, LEAVERS_COLS)
+    # ---- Planning tables in a form (reliable commit)
+    with st.form("planning_form", clear_on_submit=False):
 
-    leavers_df = st.data_editor(
-        st.session_state.leavers_df,
-        num_rows="dynamic",
-        use_container_width=True,
-        column_config={
-            "Name/Label (optional)": st.column_config.TextColumn(),
-            "Role": st.column_config.SelectboxColumn(options=LEAVER_ROLES, required=True),
-            "Leaving type": st.column_config.SelectboxColumn(options=LEAVER_TYPES, required=True),
-            "WTE": st.column_config.NumberColumn(min_value=0.0, step=0.01),
-        },
-        key="leavers_editor",
-    )
-    st.session_state.leavers_df = leavers_df
+        st.subheader("3) Leavers list (Retirements / Resignations)")
+        LEAVERS_COLS = ["Name/Label (optional)", "Role", "Leaving type", "WTE"]
+        leavers_base = ensure_columns(st.session_state.leavers_df, LEAVERS_COLS)
 
-    st.markdown("---")
-    st.subheader("4) Job-sharers list")
-    st.write("Enter one row per job-sharing teacher. The app converts **count ÷ 2** into WTE.")
+        # Default WTE to 1.0 where blank/invalid (helps non-coders)
+        if len(leavers_base):
+            leavers_base["WTE"] = pd.to_numeric(leavers_base["WTE"], errors="coerce").fillna(1.0)
+        else:
+            leavers_base["WTE"] = pd.Series(dtype=float)
 
-    JOB_COLS = ["Name/Label (optional)"]
-    st.session_state.jobsharers_df = ensure_columns(st.session_state.jobsharers_df, JOB_COLS)
+        leavers_df = st.data_editor(
+            leavers_base,
+            num_rows="dynamic",
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "Name/Label (optional)": st.column_config.TextColumn(),
+                "Role": st.column_config.SelectboxColumn(options=LEAVER_ROLES, required=True),
+                "Leaving type": st.column_config.SelectboxColumn(options=LEAVER_TYPES, required=True),
+                "WTE": st.column_config.NumberColumn(min_value=0.0, step=0.01),
+            },
+            key="leavers_editor",
+        )
 
-    jobsharers_df = st.data_editor(
-        st.session_state.jobsharers_df,
-        num_rows="dynamic",
-        use_container_width=True,
-        column_config={"Name/Label (optional)": st.column_config.TextColumn()},
-        key="jobshare_editor",
-    )
-    st.session_state.jobsharers_df = jobsharers_df
+        st.markdown("---")
+        st.subheader("4) Job-sharers list")
+        st.caption("One row per job-sharing teacher. Count ÷ 2 = WTE.")
+        JOB_COLS = ["Name/Label (optional)"]
+        job_base = ensure_columns(st.session_state.jobsharers_df, JOB_COLS)
 
-    st.markdown("---")
-    st.subheader("5) Career break / Secondment list (hours/week)")
-    st.write("Enter the teacher's **current hours/week**. Converted to WTE using hours/Hours-per-post.")
+        jobsharers_df = st.data_editor(
+            job_base,
+            num_rows="dynamic",
+            use_container_width=True,
+            hide_index=True,
+            column_config={"Name/Label (optional)": st.column_config.TextColumn()},
+            key="jobshare_editor",
+        )
 
-    ABS_COLS = ["Name/Label (optional)", "Absence type", "Current hours/week"]
-    st.session_state.absences_df = ensure_columns(st.session_state.absences_df, ABS_COLS)
+        st.markdown("---")
+        st.subheader("5) Career break / Secondment list (hours/week)")
+        st.caption("Enter current hours/week; converted to WTE using hours-per-post.")
+        ABS_COLS = ["Name/Label (optional)", "Absence type", "Current hours/week"]
+        abs_base = ensure_columns(st.session_state.absences_df, ABS_COLS)
 
-    abs_df = st.data_editor(
-        st.session_state.absences_df,
-        num_rows="dynamic",
-        use_container_width=True,
-        column_config={
-            "Name/Label (optional)": st.column_config.TextColumn(),
-            "Absence type": st.column_config.SelectboxColumn(options=ABSENCE_TYPES, required=True),
-            "Current hours/week": st.column_config.NumberColumn(min_value=0.0, step=0.5),
-        },
-        key="absences_editor",
-    )
-    st.session_state.absences_df = abs_df
+        abs_df = st.data_editor(
+            abs_base,
+            num_rows="dynamic",
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "Name/Label (optional)": st.column_config.TextColumn(),
+                "Absence type": st.column_config.SelectboxColumn(options=ABSENCE_TYPES, required=True),
+                "Current hours/week": st.column_config.NumberColumn(min_value=0.0, step=0.5),
+            },
+            key="absences_editor",
+        )
 
-    st.markdown("---")
-    st.subheader("6) CID pipeline (hours/week)")
-    st.write("For planning, assume CIDs listed will be awarded. Rows marked Declined/Not applicable are ignored.")
+        st.markdown("---")
+        st.subheader("6) CID pipeline (hours/week)")
+        st.caption("For planning, all rows except Declined/Not applicable are assumed to be awarded.")
+        CID_COLS = ["Teacher (optional)", "CID hours/week", "Status"]
+        cid_base = ensure_columns(st.session_state.cid_df, CID_COLS)
 
-    CID_COLS = ["Teacher (optional)", "CID hours/week", "Status"]
-    st.session_state.cid_df = ensure_columns(st.session_state.cid_df, CID_COLS)
+        cid_df = st.data_editor(
+            cid_base,
+            num_rows="dynamic",
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "Teacher (optional)": st.column_config.TextColumn(),
+                "CID hours/week": st.column_config.NumberColumn(min_value=0.0, step=0.5),
+                "Status": st.column_config.SelectboxColumn(options=CID_STATUSES, required=True),
+            },
+            key="cid_editor",
+        )
 
-    cid_df = st.data_editor(
-        st.session_state.cid_df,
-        num_rows="dynamic",
-        use_container_width=True,
-        column_config={
-            "Teacher (optional)": st.column_config.TextColumn(),
-            "CID hours/week": st.column_config.NumberColumn(min_value=0.0, step=0.5),
-            "Status": st.column_config.SelectboxColumn(options=CID_STATUSES, required=True),
-        },
-        key="cid_editor",
-    )
-    st.session_state.cid_df = cid_df
+        applied = st.form_submit_button("Apply changes")
+
+    if applied:
+        st.session_state.leavers_df = leavers_df.reset_index(drop=True)
+        st.session_state.jobsharers_df = jobsharers_df.reset_index(drop=True)
+        st.session_state.absences_df = abs_df.reset_index(drop=True)
+        st.session_state.cid_df = cid_df.reset_index(drop=True)
+        st.success("Applied. Results updated.")
+        st.rerun()
 
 # -------------------------
 # Compute totals
@@ -375,11 +395,10 @@ principal_leaving_count = int((leavers_work["Role"].eq("Principal")).sum()) if l
 dp_leaving_count = int((leavers_work["Role"].eq("Deputy Principal")).sum()) if len(leavers_work) else 0
 
 # Job-share totals
-jobsharers_work = st.session_state.jobsharers_df.copy()
-jobshare_count = int(len(jobsharers_work)) if jobsharers_work is not None else 0
+jobshare_count = int(len(st.session_state.jobsharers_df)) if st.session_state.jobsharers_df is not None else 0
 jobshare_wte = jobshare_count / 2.0
 
-# Career break / secondment totals (hours/week -> WTE)
+# Career break / secondment totals
 abs_work = st.session_state.absences_df.copy()
 if len(abs_work):
     abs_work["Current hours/week"] = to_num_series(abs_work["Current hours/week"])
@@ -388,10 +407,11 @@ else:
 
 career_break_hours = float(abs_work.loc[abs_work["Absence type"].eq("Career break"), "Current hours/week"].sum()) if len(abs_work) else 0.0
 secondment_hours = float(abs_work.loc[abs_work["Absence type"].eq("Secondment"), "Current hours/week"].sum()) if len(abs_work) else 0.0
+
 career_break_wte = career_break_hours / hours_per_post if hours_per_post else 0.0
 secondment_wte = secondment_hours / hours_per_post if hours_per_post else 0.0
 
-# CIDs (assume all non-declined rows will be awarded)
+# CIDs assumed (all non-declined)
 cid_work = st.session_state.cid_df.copy()
 if len(cid_work):
     cid_work["CID hours/week"] = to_num_series(cid_work["CID hours/week"])
@@ -403,7 +423,7 @@ cid_hours_assumed = float(
 ) if len(cid_work) else 0.0
 cid_wte_assumed = cid_hours_assumed / hours_per_post if hours_per_post else 0.0
 
-# Effective P/CID next year (used for offset shown)
+# Effective P/CID (used for offset shown)
 effective_pcid_next = (
     current_pcid
     + deployment_in
@@ -420,15 +440,16 @@ effective_offset_wte = max(0.0, offset_wte_raw)
 offset_hours_target = effective_offset_wte * hours_per_post
 offset_needed = offset_relevant(offset_hours_target)
 
-# Permanent vacancy capacity (your definition for reserving appointments)
-# Uses projected permanent base WITHOUT temporary absences
+# Permanent vacancy capacity: perm allocation > projected perm base (no temporary absences)
 projected_perm_base = current_pcid + deployment_in - retire_wte - resign_wte + cid_wte_assumed
-perm_vacancy_wte_raw = perm_allocation - projected_perm_base
-perm_vacancy_wte = max(0.0, perm_vacancy_wte_raw)
+perm_vacancy_wte = max(0.0, perm_allocation - projected_perm_base)
 
-# Gross / Net hours
+# Part-time hours
+total_part_time_wte = float(pt_work["WTE (Part-time)"].sum()) if len(pt_work) else 0.0
+total_part_time_hours = total_part_time_wte * hours_per_post
+
 gross_hours_available = total_part_time_hours - offset_hours_target
-net_hours_available = gross_hours_available - cid_hours_assumed  # reserve hours for CIDs
+net_hours_available = gross_hours_available - cid_hours_assumed  # reserve CID hours
 
 # -------------------------
 # Results
@@ -454,25 +475,22 @@ with st.expander("Show calculation details", expanded=False):
     )
 
 # -------------------------
-# Reserved appointments (computed)
+# Reserved appointments
 # -------------------------
 st.subheader("8) Reserved appointments (computed)")
 
 reserved_rows: list[dict] = []
-
 if principal_leaving_count > 0:
     reserved_rows.append({"Reserved appointment": "Principal vacancy", "WTE": float(principal_leaving_count)})
 if dp_leaving_count > 0:
     reserved_rows.append({"Reserved appointment": "Deputy Principal vacancy", "WTE": float(dp_leaving_count)})
-
 if perm_vacancy_wte > 0:
     reserved_rows.append({"Reserved appointment": "Permanent vacancy capacity", "WTE": float(perm_vacancy_wte)})
-
 if cid_wte_assumed > 0:
     reserved_rows.append({"Reserved appointment": "CIDs (assumed to be awarded)", "WTE": float(cid_wte_assumed)})
 
 if reserved_rows:
-    st.dataframe(pd.DataFrame(reserved_rows), use_container_width=True)
+    st.dataframe(pd.DataFrame(reserved_rows), use_container_width=True, hide_index=True)
     if perm_vacancy_wte >= 1.0:
         st.warning(
             f"Permanent vacancy capacity is **{perm_vacancy_wte:.2f} WTE** (≥ 1.0). "
@@ -487,7 +505,7 @@ else:
 st.divider()
 st.subheader("9) Detailed allocation grid (teachers × sources) + Offset distribution")
 
-tabs = st.tabs(["A) Teacher list", "B) Allocation grid", "C) Checks & summaries", "D) Export"])
+tabs = st.tabs(["A) Teacher list", "B) Allocation grid", "C) Checks & summaries"])
 
 categories = pt_work["Part-time allocation line"].tolist() if len(pt_work) else []
 cat_wte_map = dict(zip(pt_work["Part-time allocation line"], pt_work["WTE (Part-time)"])) if len(pt_work) else {}
@@ -495,8 +513,6 @@ cat_hours = pd.Series({k: float(cat_wte_map.get(k, 0.0)) * hours_per_post for k 
 
 with tabs[0]:
     st.write("Edit teacher names. Allocation grid rows come from your **Part-time allocation lines**.")
-
-    # Schema-safe
     TEACH_COLS = ["Teacher"]
     st.session_state.teachers_df = ensure_columns(st.session_state.teachers_df, TEACH_COLS)
 
@@ -504,6 +520,7 @@ with tabs[0]:
         st.session_state.teachers_df,
         num_rows="dynamic",
         use_container_width=True,
+        hide_index=True,
         column_config={"Teacher": st.column_config.TextColumn(required=True)},
         key="teachers_editor",
     )
@@ -511,8 +528,7 @@ with tabs[0]:
 
     teachers = (
         tdf["Teacher"].fillna("").astype(str).str.strip().replace("", pd.NA).dropna().tolist()
-        if len(tdf)
-        else []
+        if len(tdf) else []
     )
 
     if categories and teachers:
@@ -526,8 +542,7 @@ with tabs[0]:
 with tabs[1]:
     teachers = (
         st.session_state.teachers_df["Teacher"].fillna("").astype(str).str.strip().replace("", pd.NA).dropna().tolist()
-        if len(st.session_state.teachers_df)
-        else []
+        if len(st.session_state.teachers_df) else []
     )
 
     if not categories:
@@ -570,8 +585,10 @@ with tabs[1]:
             st.session_state.alloc_df,
             num_rows="fixed",
             use_container_width=True,
+            hide_index=True,
             column_config={
-                c: st.column_config.NumberColumn(min_value=0.0, step=0.5) for c in st.session_state.alloc_df.columns
+                c: st.column_config.NumberColumn(min_value=0.0, step=0.5)
+                for c in st.session_state.alloc_df.columns
             },
             key="alloc_editor",
         )
@@ -580,8 +597,7 @@ with tabs[1]:
 with tabs[2]:
     teachers = (
         st.session_state.teachers_df["Teacher"].fillna("").astype(str).str.strip().replace("", pd.NA).dropna().tolist()
-        if len(st.session_state.teachers_df)
-        else []
+        if len(st.session_state.teachers_df) else []
     )
 
     if not categories or not teachers:
@@ -635,88 +651,4 @@ with tabs[2]:
                 "Remaining (h)": [float(remaining_by_cat.get(k, 0.0)) for k in categories],
             }
         )
-        st.dataframe(per_source_df, use_container_width=True)
-
-        st.markdown("### Per-teacher totals (hours/week)")
-        teacher_totals = alloc[teacher_cols].sum(axis=0)
-        per_teacher_df = pd.DataFrame(
-            {
-                "Teacher": teacher_totals.index,
-                "Total hours": [float(teacher_totals[t]) for t in teacher_totals.index],
-                "Posts equiv.": [float(teacher_totals[t]) / hours_per_post if hours_per_post else 0.0 for t in teacher_totals.index],
-            }
-        ).sort_values("Teacher")
-        st.dataframe(per_teacher_df, use_container_width=True)
-
-        st.markdown("### Contract-style breakdown (copy/paste)")
-        for teacher in teacher_cols:
-            series = alloc[teacher].reindex(categories).fillna(0.0)
-            nz = series[series > 0.0].sort_values(ascending=False)
-            total = float(series.sum())
-            if total <= 0:
-                continue
-            parts = [f"{src} {float(hrs):.1f}h" for src, hrs in nz.items()]
-            st.code(f"{teacher}: {total:.1f}h (" + ", ".join(parts) + ")", language="text")
-
-        if offset_needed:
-            st.markdown("### Offset breakdown (copy/paste)")
-            nz = offset_by_cat[offset_by_cat > 0.0].sort_values(ascending=False)
-            parts = [f"{src} {float(hrs):.1f}h" for src, hrs in nz.items()]
-            st.code(f"Offset: {float(offset_by_cat.sum()):.1f}h (" + ", ".join(parts) + ")", language="text")
-
-with tabs[3]:
-    st.write("Export a CSV breakdown of your working grid (sources × teachers).")
-
-    if not categories:
-        st.info("No part-time lines to export.")
-    else:
-        alloc = st.session_state.alloc_df.copy()
-        for c in alloc.columns:
-            alloc[c] = to_num_series(alloc[c])
-
-        # Long format breakdown
-        long_rows = []
-        for src in categories:
-            for person in alloc.columns:
-                hrs = float(alloc.loc[src, person]) if (src in alloc.index and person in alloc.columns) else 0.0
-                if hrs != 0.0:
-                    long_rows.append({"Source": src, "Person": person, "Hours/week": hrs})
-        long_df = pd.DataFrame(long_rows)
-
-        meta = pd.DataFrame(
-            [
-                {
-                    "Hours per post": hours_per_post,
-                    "Permanent allocation (WTE)": perm_allocation,
-                    "Baseline current P/CID (WTE)": current_pcid,
-                    "Deployment inward (WTE)": deployment_in,
-                    "Retirements (WTE)": retire_wte,
-                    "Resignations (WTE)": resign_wte,
-                    "Job-sharer count": jobshare_count,
-                    "Job-share WTE": jobshare_wte,
-                    "Career break hours/week": career_break_hours,
-                    "Secondment hours/week": secondment_hours,
-                    "Career break WTE": career_break_wte,
-                    "Secondment WTE": secondment_wte,
-                    "CID hours assumed": cid_hours_assumed,
-                    "CID WTE assumed": cid_wte_assumed,
-                    "Effective P/CID next year (WTE)": effective_pcid_next,
-                    "Offset WTE raw": offset_wte_raw,
-                    "Effective offset hours": offset_hours_target,
-                    "Total part-time hours": total_part_time_hours,
-                    "Gross available hours": gross_hours_available,
-                    "Net available hours after CID reserve": net_hours_available,
-                    "Principal leaving count": principal_leaving_count,
-                    "DP leaving count": dp_leaving_count,
-                    "Permanent vacancy capacity (WTE)": perm_vacancy_wte,
-                }
-            ]
-        )
-
-        csv_pack = meta.to_csv(index=False) + "\n" + long_df.to_csv(index=False)
-        st.download_button(
-            "Download CSV (meta + breakdown)",
-            data=csv_pack.encode("utf-8"),
-            file_name="fixed_term_working_export.csv",
-            mime="text/csv",
-        )
+        st.dataframe(per_source_df, use_container_width=True, hide_index=True)
