@@ -1,28 +1,19 @@
 # streamlit_app.py
 # Fixed-Term Hours Planner (Working Document) — Streamlit
-# Improvements added:
-# - "Apply changes" button for planning tables (prevents uncommitted edits / non-updating)
-# - hide_index=True for tables (removes left index column)
-# - default leaver WTE to 1.0 when blank (reduces accidental 0.0)
 #
-# Core spec:
-# - Spreadsheet-style (no certainty mode; no status column on leavers)
-# - Part-time allocation lines include Increased Enrolment Allocation
-# - Leavers list with Role dropdown (Teacher/Principal/Deputy Principal), no pre-population
-# - Temporary absences split:
-#     (A) Job-sharers list: one row per job-sharing teacher; WTE = count/2
-#     (B) Career break / Secondment list: input current hours/week; app converts to WTE (hours/HoursPerPost)
-# - Offset shown ALWAYS reflects: current P/CID + deployment in - leavers + assumed new CIDs - jobshare - CB/sec
-# - Offset distribution grid appears only when offset is positive
-# - Reserved appointments window (computed, not input):
-#     * Principal vacancy reserve (if Principal leaving)
-#     * Deputy Principal vacancy reserve (count of DPs leaving)
-#     * Permanent vacancy capacity (if Perm Allocation > projected_perm_base)
-#     * CIDs assumed (non-declined) as reserved WTE
-# - Save/Load JSON
-# - Schema-safe data_editor tables (prevents column mismatch errors)
+# Key logic (updated):
+# - Effective P/CID next year (for offset/surplus) does NOT subtract job-share/CB/secondment.
+# - Job-share/CB/secondment create RELEASED HOURS to spend (allocate to teachers and/or offset).
+# - Released hours appear as extra "source" rows in the allocation grid:
+#     Released hours - Job-share
+#     Released hours - Career break
+#     Released hours - Secondment
+# - Allocation grid shows Available/Allocated/Remaining on the SAME screen.
+# - Grid accepts time entry like 10:30 (hours:minutes) as well as decimals.
+# - Planning tables use Apply button to avoid lost/uncommitted edits.
 
 import json
+import re
 import streamlit as st
 import pandas as pd
 
@@ -32,6 +23,11 @@ import pandas as pd
 HOURS_PER_POST_DEFAULT = 22.0
 OFFSET_COL_NAME = "Offset (target)"
 TOL_HOURS = 0.05
+
+# Source row names for released hours
+REL_JS = "Released hours - Job-share"
+REL_CB = "Released hours - Career break"
+REL_SEC = "Released hours - Secondment"
 
 DEFAULT_PART_TIME_LINES = [
     "Ordinary Enrolment (Part-time)",
@@ -76,20 +72,89 @@ def offset_relevant(offset_hours_target: float) -> bool:
     return offset_hours_target > 0.0001
 
 
+def parse_time_to_hours(x) -> float:
+    """
+    Accepts:
+      - 10            -> 10.0
+      - 10.5          -> 10.5
+      - "10:30"       -> 10.5
+      - "10h 30m"     -> 10.5
+      - "90m"         -> 1.5
+      - "" / None     -> 0.0
+    Returns hours as float.
+    """
+    if x is None:
+        return 0.0
+    if isinstance(x, (int, float)):
+        try:
+            return float(x)
+        except Exception:
+            return 0.0
+
+    s = str(x).strip().lower()
+    if s == "":
+        return 0.0
+
+    # H:MM
+    m = re.match(r"^(\d+)\s*:\s*(\d{1,2})$", s)
+    if m:
+        h = int(m.group(1))
+        mins = int(m.group(2))
+        mins = max(0, min(mins, 59))
+        return h + mins / 60.0
+
+    # "10h 30m" or "10h" or "30m"
+    m = re.match(r"^(?:(\d+)\s*h)?\s*(?:(\d+)\s*m)?$", s)
+    if m and (m.group(1) or m.group(2)):
+        h = int(m.group(1) or 0)
+        mins = int(m.group(2) or 0)
+        return h + mins / 60.0
+
+    # "90m"
+    m = re.match(r"^(\d+)\s*m$", s)
+    if m:
+        return int(m.group(1)) / 60.0
+
+    # Fall back to float
+    try:
+        return float(s)
+    except Exception:
+        return 0.0
+
+
+def df_to_hours(df: pd.DataFrame) -> pd.DataFrame:
+    """Convert a dataframe of mixed inputs into numeric hours."""
+    out = df.copy()
+    for c in out.columns:
+        out[c] = out[c].apply(parse_time_to_hours)
+    return out
+
+
+def hours_to_hmm(hours: float) -> str:
+    """Format float hours as H:MM."""
+    try:
+        total_mins = int(round(float(hours) * 60))
+    except Exception:
+        return "0:00"
+    h = total_mins // 60
+    m = total_mins % 60
+    return f"{h}:{m:02d}"
+
+
 def ensure_alloc_schema(categories: list[str], teachers: list[str], include_offset: bool):
     """Only rebuild allocation matrix when schema changes."""
     desired_cols = list(teachers) + ([OFFSET_COL_NAME] if include_offset else [])
     desired_index = list(categories)
 
     if "alloc_df" not in st.session_state or st.session_state.alloc_df is None:
-        st.session_state.alloc_df = pd.DataFrame(0.0, index=desired_index, columns=desired_cols)
+        st.session_state.alloc_df = pd.DataFrame("", index=desired_index, columns=desired_cols)
         return
 
     old = st.session_state.alloc_df
     if list(old.index) == desired_index and list(old.columns) == desired_cols:
         return
 
-    new = pd.DataFrame(0.0, index=desired_index, columns=desired_cols)
+    new = pd.DataFrame("", index=desired_index, columns=desired_cols)
     common_rows = [r for r in old.index if r in new.index]
     common_cols = [c for c in old.columns if c in new.columns]
     if common_rows and common_cols:
@@ -184,10 +249,7 @@ def init_state():
 
     if "part_time_df" not in st.session_state:
         st.session_state.part_time_df = pd.DataFrame(
-            {
-                "Part-time allocation line": DEFAULT_PART_TIME_LINES,
-                "WTE (Part-time)": [0.0] * len(DEFAULT_PART_TIME_LINES),
-            }
+            {"Part-time allocation line": DEFAULT_PART_TIME_LINES, "WTE (Part-time)": [0.0] * len(DEFAULT_PART_TIME_LINES)}
         )
 
     if "leavers_df" not in st.session_state:
@@ -206,7 +268,7 @@ def init_state():
         st.session_state.teachers_df = pd.DataFrame({"Teacher": DEFAULT_TEACHERS})
 
     if "alloc_df" not in st.session_state:
-        st.session_state.alloc_df = pd.DataFrame(0.0, index=DEFAULT_PART_TIME_LINES, columns=DEFAULT_TEACHERS)
+        st.session_state.alloc_df = pd.DataFrame("", index=DEFAULT_PART_TIME_LINES, columns=DEFAULT_TEACHERS)
 
 
 # -------------------------
@@ -216,7 +278,7 @@ st.set_page_config(page_title="Fixed-Term Hours Planner", layout="wide")
 init_state()
 
 st.title("Fixed-Term Hours Planner (Working Document)")
-st.caption("Spreadsheet-style: edit figures whenever they change; click Apply for the planning tables.")
+st.caption("Edit figures whenever they change. Use **Apply changes** for planning tables. Allocation grid accepts 10:30 format.")
 
 with st.sidebar:
     st.header("Settings")
@@ -241,11 +303,11 @@ with st.sidebar:
 
 hours_per_post = float(st.session_state.hours_per_post)
 
-# -------------------------
-# Baseline schedule inputs + Part-time lines
-# -------------------------
 left, right = st.columns([1.25, 1.0], gap="large")
 
+# -------------------------
+# Left: schedule + part-time lines
+# -------------------------
 with left:
     st.subheader("1) Schedule baseline (Department documents)")
     st.number_input("Total Permanent Allocation (WTE) — Page 1", key="perm_allocation_wte", step=0.01)
@@ -277,25 +339,25 @@ with left:
     total_part_time_hours = total_part_time_wte * hours_per_post
     st.info(f"**Total Part-time Allocation:** {total_part_time_wte:.2f} WTE  \n**= {total_part_time_hours:.2f} hours/week**")
 
+# -------------------------
+# Right: planning tables (apply button)
+# -------------------------
 with right:
     st.subheader("2) Planning inputs")
     st.number_input("Deployment inward (WTE) (optional)", key="deployment_inward_wte", step=0.01)
 
     st.markdown("---")
-    st.write("Edit the tables below, then click **Apply changes** (this prevents lost edits).")
+    st.write("Edit the tables below, then click **Apply changes** (prevents lost edits).")
 
-    # ---- Planning tables in a form (reliable commit)
     with st.form("planning_form", clear_on_submit=False):
 
         st.subheader("3) Leavers list (Retirements / Resignations)")
         LEAVERS_COLS = ["Name/Label (optional)", "Role", "Leaving type", "WTE"]
         leavers_base = ensure_columns(st.session_state.leavers_df, LEAVERS_COLS)
 
-        # Default WTE to 1.0 where blank/invalid (helps non-coders)
+        # Default WTE to 1.0 if blank/invalid
         if len(leavers_base):
             leavers_base["WTE"] = pd.to_numeric(leavers_base["WTE"], errors="coerce").fillna(1.0)
-        else:
-            leavers_base["WTE"] = pd.Series(dtype=float)
 
         leavers_df = st.data_editor(
             leavers_base,
@@ -313,7 +375,7 @@ with right:
 
         st.markdown("---")
         st.subheader("4) Job-sharers list")
-        st.caption("One row per job-sharing teacher. Count ÷ 2 = WTE.")
+        st.caption("One row per job-sharing teacher. Each job-share releases 0.5 post worth of hours.")
         JOB_COLS = ["Name/Label (optional)"]
         job_base = ensure_columns(st.session_state.jobsharers_df, JOB_COLS)
 
@@ -328,7 +390,7 @@ with right:
 
         st.markdown("---")
         st.subheader("5) Career break / Secondment list (hours/week)")
-        st.caption("Enter current hours/week; converted to WTE using hours-per-post.")
+        st.caption("Enter the teacher’s current hours/week. These hours are released and must be allocated.")
         ABS_COLS = ["Name/Label (optional)", "Absence type", "Current hours/week"]
         abs_base = ensure_columns(st.session_state.absences_df, ABS_COLS)
 
@@ -394,11 +456,11 @@ resign_wte = float(leavers_work.loc[leavers_work["Leaving type"].eq("Resignation
 principal_leaving_count = int((leavers_work["Role"].eq("Principal")).sum()) if len(leavers_work) else 0
 dp_leaving_count = int((leavers_work["Role"].eq("Deputy Principal")).sum()) if len(leavers_work) else 0
 
-# Job-share totals
+# Job-share released hours
 jobshare_count = int(len(st.session_state.jobsharers_df)) if st.session_state.jobsharers_df is not None else 0
-jobshare_wte = jobshare_count / 2.0
+jobshare_released_hours = jobshare_count * (hours_per_post / 2.0)
 
-# Career break / secondment totals
+# Career break / secondment released hours
 abs_work = st.session_state.absences_df.copy()
 if len(abs_work):
     abs_work["Current hours/week"] = to_num_series(abs_work["Current hours/week"])
@@ -408,10 +470,9 @@ else:
 career_break_hours = float(abs_work.loc[abs_work["Absence type"].eq("Career break"), "Current hours/week"].sum()) if len(abs_work) else 0.0
 secondment_hours = float(abs_work.loc[abs_work["Absence type"].eq("Secondment"), "Current hours/week"].sum()) if len(abs_work) else 0.0
 
-career_break_wte = career_break_hours / hours_per_post if hours_per_post else 0.0
-secondment_wte = secondment_hours / hours_per_post if hours_per_post else 0.0
+released_hours_total = jobshare_released_hours + career_break_hours + secondment_hours
 
-# CIDs assumed (all non-declined)
+# CIDs assumed
 cid_work = st.session_state.cid_df.copy()
 if len(cid_work):
     cid_work["CID hours/week"] = to_num_series(cid_work["CID hours/week"])
@@ -423,18 +484,16 @@ cid_hours_assumed = float(
 ) if len(cid_work) else 0.0
 cid_wte_assumed = cid_hours_assumed / hours_per_post if hours_per_post else 0.0
 
-# Effective P/CID (used for offset shown)
+# Effective P/CID next year (DO NOT subtract job-share / CB / secondment)
 effective_pcid_next = (
     current_pcid
     + deployment_in
     - retire_wte
     - resign_wte
     + cid_wte_assumed
-    - jobshare_wte
-    - career_break_wte
-    - secondment_wte
 )
 
+# Offset
 offset_wte_raw = effective_pcid_next - perm_allocation
 effective_offset_wte = max(0.0, offset_wte_raw)
 offset_hours_target = effective_offset_wte * hours_per_post
@@ -448,7 +507,8 @@ perm_vacancy_wte = max(0.0, perm_allocation - projected_perm_base)
 total_part_time_wte = float(pt_work["WTE (Part-time)"].sum()) if len(pt_work) else 0.0
 total_part_time_hours = total_part_time_wte * hours_per_post
 
-gross_hours_available = total_part_time_hours - offset_hours_target
+# Availability (released hours must be allocated too)
+gross_hours_available = total_part_time_hours + released_hours_total - offset_hours_target
 net_hours_available = gross_hours_available - cid_hours_assumed  # reserve CID hours
 
 # -------------------------
@@ -459,16 +519,16 @@ st.subheader("7) Results (live)")
 
 c1, c2, c3, c4 = st.columns(4)
 c1.metric("Effective P/CID next year (WTE)", f"{effective_pcid_next:.2f}")
-c2.metric("Effective offset (hours)", f"{offset_hours_target:.2f}")
-c3.metric("Gross available (hours)", f"{gross_hours_available:.2f}")
+c2.metric("Offset target (hours)", f"{offset_hours_target:.2f}")
+c3.metric("Gross available incl. released (hours)", f"{gross_hours_available:.2f}")
 c4.metric("Net available after CID reserve (hours)", f"{net_hours_available:.2f}")
 
 with st.expander("Show calculation details", expanded=False):
     st.write(f"- Leavers: retire {retire_wte:.2f} WTE, resign {resign_wte:.2f} WTE")
-    st.write(f"- Job-sharers: {jobshare_count} teachers → {jobshare_wte:.2f} WTE")
-    st.write(f"- Career break: {career_break_hours:.1f} h/wk → {career_break_wte:.2f} WTE")
-    st.write(f"- Secondment: {secondment_hours:.1f} h/wk → {secondment_wte:.2f} WTE")
-    st.write(f"- New CIDs assumed: {cid_hours_assumed:.1f} h/wk → {cid_wte_assumed:.2f} WTE")
+    st.write(f"- Job-share count: {jobshare_count} → released {jobshare_released_hours:.2f} hours ({hours_to_hmm(jobshare_released_hours)})")
+    st.write(f"- Career break released: {career_break_hours:.2f} hours ({hours_to_hmm(career_break_hours)})")
+    st.write(f"- Secondment released: {secondment_hours:.2f} hours ({hours_to_hmm(secondment_hours)})")
+    st.write(f"- New CIDs assumed: {cid_hours_assumed:.2f} hours → {cid_wte_assumed:.2f} WTE")
     st.write(
         f"- Offset WTE = (Effective P/CID {effective_pcid_next:.2f}) − (Perm allocation {perm_allocation:.2f}) "
         f"= {offset_wte_raw:.2f} → effective {effective_offset_wte:.2f}"
@@ -507,12 +567,25 @@ st.subheader("9) Detailed allocation grid (teachers × sources) + Offset distrib
 
 tabs = st.tabs(["A) Teacher list", "B) Allocation grid", "C) Checks & summaries"])
 
-categories = pt_work["Part-time allocation line"].tolist() if len(pt_work) else []
-cat_wte_map = dict(zip(pt_work["Part-time allocation line"], pt_work["WTE (Part-time)"])) if len(pt_work) else {}
-cat_hours = pd.Series({k: float(cat_wte_map.get(k, 0.0)) * hours_per_post for k in categories})
+# Base categories from part-time schedule lines
+pt_categories = pt_work["Part-time allocation line"].tolist() if len(pt_work) else []
+
+# Add released rows (always present so principals can plan; they may be zero)
+categories = pt_categories + [REL_JS, REL_CB, REL_SEC]
+
+# Available hours per source:
+cat_hours = pd.Series({k: 0.0 for k in categories})
+# Part-time sources: WTE × hours_per_post
+if len(pt_work):
+    for _, r in pt_work.iterrows():
+        cat_hours[str(r["Part-time allocation line"])] = float(r["WTE (Part-time)"]) * hours_per_post
+# Released sources: direct hours
+cat_hours[REL_JS] = float(jobshare_released_hours)
+cat_hours[REL_CB] = float(career_break_hours)
+cat_hours[REL_SEC] = float(secondment_hours)
 
 with tabs[0]:
-    st.write("Edit teacher names. Allocation grid rows come from your **Part-time allocation lines**.")
+    st.write("Edit teacher names. Allocation grid rows come from your part-time lines PLUS released hours rows.")
     TEACH_COLS = ["Teacher"]
     st.session_state.teachers_df = ensure_columns(st.session_state.teachers_df, TEACH_COLS)
 
@@ -528,7 +601,8 @@ with tabs[0]:
 
     teachers = (
         tdf["Teacher"].fillna("").astype(str).str.strip().replace("", pd.NA).dropna().tolist()
-        if len(tdf) else []
+        if len(tdf)
+        else []
     )
 
     if categories and teachers:
@@ -542,71 +616,103 @@ with tabs[0]:
 with tabs[1]:
     teachers = (
         st.session_state.teachers_df["Teacher"].fillna("").astype(str).str.strip().replace("", pd.NA).dropna().tolist()
-        if len(st.session_state.teachers_df) else []
+        if len(st.session_state.teachers_df)
+        else []
     )
 
     if not categories:
-        st.warning("No part-time allocation lines found.")
+        st.warning("No allocation lines found.")
     elif not teachers:
         st.warning("No teachers found.")
     else:
         ensure_alloc_schema(categories, teachers, include_offset=offset_needed)
 
-        if offset_needed:
-            st.markdown("#### Offset distribution (required because offset is positive)")
-            b1, b2, b3 = st.columns([1.0, 1.0, 2.0])
-            with b1:
-                do_auto = st.button("Auto-fill Offset (proportional)")
-            with b2:
-                clear_off = st.button("Clear Offset")
-            with b3:
-                st.write(f"Offset target: **{offset_hours_target:.2f} hours**")
+        # Calculate hours from current grid values (supports 10:30 input)
+        alloc_calc = df_to_hours(st.session_state.alloc_df)
+        teacher_cols = [c for c in alloc_calc.columns if c != OFFSET_COL_NAME]
 
-            if do_auto or clear_off:
-                alloc = st.session_state.alloc_df.copy()
-                for c in alloc.columns:
-                    alloc[c] = to_num_series(alloc[c])
-
-                teacher_cols = [c for c in alloc.columns if c != OFFSET_COL_NAME]
-                teachers_given = alloc[teacher_cols].sum(axis=1).reindex(categories).fillna(0.0)
-                remaining_before_off = (cat_hours - teachers_given).reindex(categories).fillna(0.0)
-
-                if clear_off and OFFSET_COL_NAME in st.session_state.alloc_df.columns:
-                    st.session_state.alloc_df.loc[categories, OFFSET_COL_NAME] = 0.0
-
-                if do_auto and OFFSET_COL_NAME in st.session_state.alloc_df.columns:
-                    auto = auto_distribute_offset_proportional(remaining_before_off, offset_hours_target)
-                    st.session_state.alloc_df.loc[categories, OFFSET_COL_NAME] = auto.values
-        else:
-            st.info("Offset is not positive, so Offset distribution is not required (Offset column hidden).")
-
-        st.caption("Enter **hours/week** per teacher per source (supports contract wording).")
-        alloc_df = st.data_editor(
-            st.session_state.alloc_df,
-            num_rows="fixed",
-            use_container_width=True,
-            hide_index=True,
-            column_config={
-                c: st.column_config.NumberColumn(min_value=0.0, step=0.5)
-                for c in st.session_state.alloc_df.columns
-            },
-            key="alloc_editor",
+        teachers_given_by_cat = alloc_calc[teacher_cols].sum(axis=1).reindex(categories).fillna(0.0)
+        offset_by_cat = (
+            alloc_calc[OFFSET_COL_NAME].reindex(categories).fillna(0.0)
+            if offset_needed and OFFSET_COL_NAME in alloc_calc.columns
+            else pd.Series(0.0, index=categories)
         )
-        st.session_state.alloc_df = alloc_df
+
+        available_by_cat = cat_hours.reindex(categories).fillna(0.0)
+        allocated_by_cat = teachers_given_by_cat + offset_by_cat
+        remaining_by_cat = available_by_cat - allocated_by_cat
+
+        left_sum, right_grid = st.columns([0.45, 0.55], gap="large")
+
+        with left_sum:
+            st.markdown("#### Source hours (Available / Allocated / Remaining)")
+            summary_df = pd.DataFrame(
+                {
+                    "Source": categories,
+                    "Available (h)": [float(available_by_cat.get(k, 0.0)) for k in categories],
+                    "Available (H:MM)": [hours_to_hmm(float(available_by_cat.get(k, 0.0))) for k in categories],
+                    "Allocated (h)": [float(allocated_by_cat.get(k, 0.0)) for k in categories],
+                    "Allocated (H:MM)": [hours_to_hmm(float(allocated_by_cat.get(k, 0.0))) for k in categories],
+                    "Remaining (h)": [float(remaining_by_cat.get(k, 0.0)) for k in categories],
+                    "Remaining (H:MM)": [hours_to_hmm(float(remaining_by_cat.get(k, 0.0))) for k in categories],
+                }
+            )
+            st.dataframe(summary_df, use_container_width=True, hide_index=True)
+
+            if offset_needed:
+                st.markdown("#### Offset distribution controls")
+                b1, b2 = st.columns(2)
+                with b1:
+                    do_auto = st.button("Auto-fill Offset (proportional)")
+                with b2:
+                    clear_off = st.button("Clear Offset")
+                st.write(f"Offset target: **{offset_hours_target:.2f} hours** ({hours_to_hmm(offset_hours_target)})")
+
+                if do_auto or clear_off:
+                    alloc = df_to_hours(st.session_state.alloc_df)
+
+                    teacher_cols2 = [c for c in alloc.columns if c != OFFSET_COL_NAME]
+                    teachers_given2 = alloc[teacher_cols2].sum(axis=1).reindex(categories).fillna(0.0)
+                    remaining_before_off = (available_by_cat - teachers_given2).reindex(categories).fillna(0.0)
+
+                    if clear_off and OFFSET_COL_NAME in st.session_state.alloc_df.columns:
+                        st.session_state.alloc_df.loc[categories, OFFSET_COL_NAME] = ""
+
+                    if do_auto and OFFSET_COL_NAME in st.session_state.alloc_df.columns:
+                        auto = auto_distribute_offset_proportional(remaining_before_off, offset_hours_target)
+                        # Store as H:MM strings (nicer) — but decimals also fine
+                        st.session_state.alloc_df.loc[categories, OFFSET_COL_NAME] = [hours_to_hmm(v) for v in auto.values]
+
+                    st.rerun()
+            else:
+                st.info("Offset is not positive, so Offset distribution is not required.")
+
+        with right_grid:
+            st.caption("Enter hours as **H:MM** (e.g., 10:30) or decimals (e.g., 10.5).")
+            alloc_df = st.data_editor(
+                st.session_state.alloc_df,
+                num_rows="fixed",
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    c: st.column_config.TextColumn(help="Examples: 10, 10:30, 10.5, 90m")
+                    for c in st.session_state.alloc_df.columns
+                },
+                key="alloc_editor",
+            )
+            st.session_state.alloc_df = alloc_df
 
 with tabs[2]:
     teachers = (
         st.session_state.teachers_df["Teacher"].fillna("").astype(str).str.strip().replace("", pd.NA).dropna().tolist()
-        if len(st.session_state.teachers_df) else []
+        if len(st.session_state.teachers_df)
+        else []
     )
 
     if not categories or not teachers:
         st.info("Add sources and teachers to see summaries.")
     else:
-        alloc = st.session_state.alloc_df.copy()
-        for c in alloc.columns:
-            alloc[c] = to_num_series(alloc[c])
-
+        alloc = df_to_hours(st.session_state.alloc_df)
         teacher_cols = [c for c in alloc.columns if c != OFFSET_COL_NAME]
 
         teachers_given_by_cat = alloc[teacher_cols].sum(axis=1).reindex(categories).fillna(0.0)
@@ -616,8 +722,9 @@ with tabs[2]:
             else pd.Series(0.0, index=categories)
         )
 
+        available_by_cat = cat_hours.reindex(categories).fillna(0.0)
         total_given_by_cat = teachers_given_by_cat + offset_by_cat
-        remaining_by_cat = cat_hours - total_given_by_cat
+        remaining_by_cat = available_by_cat - total_given_by_cat
 
         st.markdown("### Validation checks")
 
@@ -637,18 +744,34 @@ with tabs[2]:
         if over_alloc.any():
             st.error("One or more sources are over-allocated:")
             for src, val in remaining_by_cat[over_alloc].items():
-                st.write(f"- **{src}** is over by **{abs(float(val)):.2f} hours**")
+                st.write(f"- **{src}** is over by **{abs(float(val)):.2f} hours** ({hours_to_hmm(abs(float(val)))})")
         else:
             st.success("No source is over-allocated.")
 
-        st.markdown("### Per-source summary")
-        per_source_df = pd.DataFrame(
+        st.markdown("### Per-teacher totals (hours/week)")
+        teacher_totals = alloc[teacher_cols].sum(axis=0)
+        per_teacher_df = pd.DataFrame(
             {
-                "Source": categories,
-                "Available (h)": [float(cat_hours.get(k, 0.0)) for k in categories],
-                "Teachers (h)": [float(teachers_given_by_cat.get(k, 0.0)) for k in categories],
-                "Offset (h)": [float(offset_by_cat.get(k, 0.0)) for k in categories],
-                "Remaining (h)": [float(remaining_by_cat.get(k, 0.0)) for k in categories],
+                "Teacher": teacher_totals.index,
+                "Total (h)": [float(teacher_totals[t]) for t in teacher_totals.index],
+                "Total (H:MM)": [hours_to_hmm(float(teacher_totals[t])) for t in teacher_totals.index],
             }
-        )
-        st.dataframe(per_source_df, use_container_width=True, hide_index=True)
+        ).sort_values("Teacher")
+        st.dataframe(per_teacher_df, use_container_width=True, hide_index=True)
+
+        st.markdown("### Contract-style breakdown (copy/paste)")
+        for teacher in teacher_cols:
+            series = alloc[teacher].reindex(categories).fillna(0.0)
+            nz = series[series > 0.0].sort_values(ascending=False)
+            total = float(series.sum())
+            if total <= 0:
+                continue
+            parts = [f"{src} {hours_to_hmm(float(hrs))}" for src, hrs in nz.items()]
+            st.code(f"{teacher}: {hours_to_hmm(total)} (" + ", ".join(parts) + ")", language="text")
+
+        if offset_needed:
+            st.markdown("### Offset breakdown (copy/paste)")
+            nz = offset_by_cat[offset_by_cat > 0.0].sort_values(ascending=False)
+            total = float(offset_by_cat.sum())
+            parts = [f"{src} {hours_to_hmm(float(hrs))}" for src, hrs in nz.items()]
+            st.code(f"Offset: {hours_to_hmm(total)} (" + ", ".join(parts) + ")", language="text")
